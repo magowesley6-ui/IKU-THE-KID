@@ -1,15 +1,14 @@
-
-name: ExtNoBrasil PC Gamer - Linux Mint macOS
+name: ExtNoBrasil PC Gamer - Mint XFCE
 
 on:
   workflow_dispatch:
     inputs:
       vnc_password:
-        description: "Senha VNC: 6 a 8 letras ou numeros"
+        description: "Senha VNC de 6 a 8 letras ou numeros"
         required: true
         type: string
       boot_mode:
-        description: "Primeira vez: installer. Depois: disk."
+        description: "Primeira vez installer; depois disk"
         required: true
         type: choice
         default: installer
@@ -34,103 +33,61 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             qemu-system-x86 qemu-utils novnc websockify \
-            socat curl wget ca-certificates git
+            socat curl wget ca-certificates
+
           mkdir -p "$HOME/virtual-pc"
 
-      - name: Restaurar disco virtual
+      - name: Restaurar ultimo checkpoint
+        id: restore
         uses: actions/cache/restore@v4
         with:
           path: ~/virtual-pc/mint.qcow2
-          key: mint-pc-${{ github.repository }}-${{ github.run_id }}
+          key: mint-xfce-${{ github.repository }}-${{ github.run_id }}
           restore-keys: |
-            mint-pc-${{ github.repository }}-
+            mint-xfce-${{ github.repository }}-
 
-      - name: Preparar disco e ISO
+      - name: Preparar disco virtual
         shell: bash
         run: |
           set -Eeuo pipefail
+
           DIR="$HOME/virtual-pc"
           DISK="$DIR/mint.qcow2"
           ISO="$DIR/linuxmint.iso"
 
-          if [ ! -f "$DISK" ]; then
-            qemu-img create -f qcow2 "$DISK" 145G
-          else
+          if [ -f "$DISK" ]; then
+            echo "Checkpoint encontrado. Verificando disco..."
             qemu-img check "$DISK"
+          else
+            echo "Criando novo disco virtual de 145 GB..."
+            qemu-img create -f qcow2 "$DISK" 145G
           fi
 
           if [ ! -s "$ISO" ]; then
-            wget -O "$ISO" \
-              "https://pub.linuxmint.io/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso"
+            URL="https://pub.linuxmint.io/stable/22.3/linuxmint-22.3-xfce-64bit.iso"
+
+            if ! wget -O "$ISO" "$URL"; then
+              rm -f "$ISO"
+              echo "Falha ao baixar a ISO do Linux Mint."
+              exit 1
+            fi
           fi
 
           test -s "$ISO"
           qemu-img info "$DISK"
-          ls -lh "$ISO"
 
-      - name: Preparar instalador visual macOS
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cat > "$HOME/virtual-pc/mint-macos-setup.sh" <<'SCRIPT'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-
-          sudo apt-get update
-          sudo apt-get install -y git plank
-
-          cd /tmp
-          rm -rf WhiteSur-gtk-theme WhiteSur-icon-theme
-
-          git clone --depth 1 \
-            https://github.com/vinceliuice/WhiteSur-gtk-theme.git
-          cd WhiteSur-gtk-theme
-          ./install.sh -t all
-
-          cd /tmp
-          git clone --depth 1 \
-            https://github.com/vinceliuice/WhiteSur-icon-theme.git
-          cd WhiteSur-icon-theme
-          ./install.sh
-
-          mkdir -p "$HOME/.config/autostart"
-          cat > "$HOME/.config/autostart/plank.desktop" <<'DESKTOP'
-          [Desktop Entry]
-          Type=Application
-          Name=Plank Dock
-          Exec=plank
-          X-GNOME-Autostart-enabled=true
-          DESKTOP
-
-          echo "Instalacao visual concluida."
-          SCRIPT
-
-          chmod 755 "$HOME/virtual-pc/mint-macos-setup.sh"
-          echo "Instalador criado no ambiente do runner."
-          echo "Ele ainda precisa ser executado dentro do Mint."
-
-      - name: Instalar Cloudflare Tunnel
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          curl -fsSL \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o /tmp/cloudflared
-          sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
-          cloudflared --version
-
-      - name: Iniciar PC Virtual
+      - name: Iniciar PC Virtual com checkpoint
         env:
           VNC_PASSWORD: ${{ inputs.vnc_password }}
           BOOT_MODE: ${{ inputs.boot_mode }}
         shell: bash
         run: |
           set -Eeuo pipefail
+
           echo "::add-mask::$VNC_PASSWORD"
 
           if [[ ! "$VNC_PASSWORD" =~ ^[A-Za-z0-9]{6,8}$ ]]; then
-            echo "Erro: a senha deve ter de 6 a 8 letras ou numeros."
+            echo "A senha deve ter entre 6 e 8 letras ou numeros."
             exit 1
           fi
 
@@ -138,31 +95,125 @@ jobs:
           DISK="$DIR/mint.qcow2"
           ISO="$DIR/linuxmint.iso"
 
-          if [ ! -s "$DISK" ] || [ ! -s "$ISO" ]; then
-            echo "Erro: disco ou ISO nao encontrado."
-            exit 1
-          fi
+          MONITOR="/tmp/qemu-monitor.sock"
+          QEMU_LOG="/tmp/qemu.log"
+          VNC_LOG="/tmp/websockify.log"
+          TUNNEL_LOG="/tmp/cloudflared.log"
 
-          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+          QEMU_PID=""
+          WEBSOCKIFY_PID=""
+          CLOUDFLARED_PID=""
+          CLEANING=0
+
+          cleanup() {
+            local EXIT_CODE=$?
+
+            if [ "$CLEANING" -eq 1 ]; then
+              return
+            fi
+            CLEANING=1
+
+            trap - EXIT INT TERM
+
+            echo
+            echo "===================================="
+            echo " CHECKPOINT AUTOMATICO"
+            echo " Encerrando a sessao e salvando..."
+            echo "===================================="
+
+            # Solicita o encerramento pelo monitor do QEMU.
+            # O QEMU fecha o disco e descarrega as escritas pendentes.
+            if [ -n "$QEMU_PID" ] &&
+               kill -0 "$QEMU_PID" 2>/dev/null &&
+               [ -S "$MONITOR" ]; then
+              printf 'quit\n' |
+                socat -T 5 - UNIX-CONNECT:"$MONITOR" \
+                >/dev/null 2>&1 || true
+            fi
+
+            # Aguarda o QEMU terminar antes de salvar o checkpoint.
+            if [ -n "$QEMU_PID" ]; then
+              for i in $(seq 1 20); do
+                kill -0 "$QEMU_PID" 2>/dev/null || break
+                sleep 1
+              done
+
+              if kill -0 "$QEMU_PID" 2>/dev/null; then
+                echo "QEMU nao encerrou a tempo; tentando finalizar..."
+                kill -TERM "$QEMU_PID" 2>/dev/null || true
+
+                for i in $(seq 1 5); do
+                  kill -0 "$QEMU_PID" 2>/dev/null || break
+                  sleep 1
+                done
+              fi
+
+              if kill -0 "$QEMU_PID" 2>/dev/null; then
+                echo "Aviso: QEMU ainda esta ativo."
+                kill -KILL "$QEMU_PID" 2>/dev/null || true
+              fi
+
+              wait "$QEMU_PID" 2>/dev/null || true
+            fi
+
+            kill "${CLOUDFLARED_PID:-}" 2>/dev/null || true
+            kill "${WEBSOCKIFY_PID:-}" 2>/dev/null || true
+
+            wait "${CLOUDFLARED_PID:-}" 2>/dev/null || true
+            wait "${WEBSOCKIFY_PID:-}" 2>/dev/null || true
+
+            # O disco so deve ser verificado depois de parar o QEMU.
+            if [ -s "$DISK" ]; then
+              sync
+
+              if qemu-img check "$DISK"; then
+                echo "Disco verificado com sucesso."
+                echo "O checkpoint sera entregue a etapa de cache."
+              else
+                echo "ERRO: verificacao do disco falhou."
+                EXIT_CODE=1
+              fi
+            else
+              echo "ERRO: arquivo do disco virtual nao encontrado."
+              EXIT_CODE=1
+            fi
+
+            rm -f "$MONITOR"
+
+            echo "Finalizacao do checkpoint concluida."
+            return "$EXIT_CODE"
+          }
+
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          if [ -c /dev/kvm ] &&
+             [ -r /dev/kvm ] &&
+             [ -w /dev/kvm ]; then
             ACCEL=(-enable-kvm)
             CPU=host
-            echo "KVM disponivel."
+            echo "Aceleracao KVM disponivel."
           else
             ACCEL=(-accel tcg,thread=multi)
             CPU=max
-            echo "KVM indisponivel: usando emulacao por software."
+            echo "Aviso: emulacao por software; desempenho limitado."
           fi
 
           case "$BOOT_MODE" in
-            installer) BOOT=(-boot order=d,menu=on) ;;
-            disk) BOOT=(-boot order=c,menu=on) ;;
+            installer)
+              BOOT=(-boot order=d,menu=on)
+              ;;
+            disk)
+              BOOT=(-boot order=c,menu=on)
+              ;;
             *)
-              echo "Modo de inicializacao invalido."
+              echo "Modo de boot invalido."
               exit 1
               ;;
           esac
 
-          rm -f /tmp/qemu-monitor.sock /tmp/qemu.log
+          rm -f "$MONITOR" "$QEMU_LOG"
 
           qemu-system-x86_64 \
             "${ACCEL[@]}" \
@@ -179,115 +230,124 @@ jobs:
             -rtc base=utc \
             -display none \
             -vnc 127.0.0.1:1,password=on \
-            -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
-            > /tmp/qemu.log 2>&1 &
+            -monitor unix:"$MONITOR",server,nowait \
+            > "$QEMU_LOG" 2>&1 &
 
           QEMU_PID=$!
 
-          cleanup() {
-            kill "${CLOUDFLARED_PID:-}" 2>/dev/null || true
-            kill "${WEBSOCKIFY_PID:-}" 2>/dev/null || true
-            kill "$QEMU_PID" 2>/dev/null || true
-          }
-          trap cleanup EXIT
+          for i in $(seq 1 40); do
+            [ -S "$MONITOR" ] && break
 
-          READY=0
-          for i in $(seq 1 45); do
-            if [ -S /tmp/qemu-monitor.sock ]; then
-              READY=1
-              break
-            fi
             if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-              cat /tmp/qemu.log
+              cat "$QEMU_LOG"
               exit 1
             fi
+
             sleep 2
           done
 
-          if [ "$READY" -ne 1 ]; then
-            echo "QEMU nao iniciou corretamente."
-            cat /tmp/qemu.log
+          if [ ! -S "$MONITOR" ]; then
+            echo "QEMU nao criou o monitor."
+            cat "$QEMU_LOG"
             exit 1
           fi
 
-          # Configurar a senha VNC pelo monitor do QEMU.
           MONITOR_OUTPUT=$(
             printf 'change vnc password %s\n' "$VNC_PASSWORD" |
-              socat -T 5 - UNIX-CONNECT:/tmp/qemu-monitor.sock 2>&1 || true
+              socat -T 5 - UNIX-CONNECT:"$MONITOR" 2>&1 || true
           )
 
-          if ! grep -qi "password" <<< "$MONITOR_OUTPUT"; then
-            echo "Aviso: nao foi possivel confirmar a resposta da senha VNC."
-            echo "Verifique a conexao VNC se o acesso falhar."
+          if grep -qiE 'unknown command|invalid password|error' \
+            <<< "$MONITOR_OUTPUT"; then
+            echo "Erro ao configurar a senha VNC."
+            echo "$MONITOR_OUTPUT"
+            exit 1
           fi
 
-          # noVNC: porta web 6080 -> VNC 5901.
           websockify --web=/usr/share/novnc \
-            6080 127.0.0.1:5901 > /tmp/websockify.log 2>&1 &
+            6080 127.0.0.1:5901 \
+            > "$VNC_LOG" 2>&1 &
           WEBSOCKIFY_PID=$!
 
           sleep 3
+
           if ! kill -0 "$WEBSOCKIFY_PID" 2>/dev/null; then
-            echo "Erro ao iniciar noVNC:"
-            cat /tmp/websockify.log
+            cat "$VNC_LOG"
             exit 1
           fi
 
-          cloudflared tunnel \
+          curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+
+          /tmp/cloudflared tunnel \
             --url http://127.0.0.1:6080 \
             --no-autoupdate \
-            > /tmp/cloudflared.log 2>&1 &
+            > "$TUNNEL_LOG" 2>&1 &
           CLOUDFLARED_PID=$!
 
           URL=""
+
           for i in $(seq 1 60); do
-            URL=$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
-              /tmp/cloudflared.log | head -n 1 || true)
+            URL=$(grep -Eo \
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              "$TUNNEL_LOG" | head -n 1 || true)
 
-            if [ -n "$URL" ]; then
-              break
-            fi
+            [ -n "$URL" ] && break
 
-            if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
-              cat /tmp/cloudflared.log
-              exit 1
-            fi
-
+            kill -0 "$CLOUDFLARED_PID" 2>/dev/null || break
             sleep 2
           done
 
           if [ -z "$URL" ]; then
-            echo "Nao foi possivel obter o endereco Cloudflare."
-            cat /tmp/cloudflared.log
+            echo "Cloudflare nao forneceu um endereco."
+            cat "$TUNNEL_LOG"
             exit 1
           fi
 
           echo
-          echo "=========================================="
-          echo "       EXT NOBRASIL PC GAMER"
-          echo "=========================================="
-          echo "Sistema: Linux Mint Cinnamon"
+          echo "===================================="
+          echo "     EXT NOBRASIL PC GAMER"
+          echo "===================================="
+          echo "Sistema: Linux Mint XFCE"
           echo "Disco virtual: 145 GB"
-          echo "Memoria RAM configurada: 4 GB"
-          echo "CPU virtual: 2 nucleos"
-          echo "Modo: $BOOT_MODE"
-          echo "Endereco: ${URL}/vnc.html?autoconnect=true&resize=scale"
-          echo "Senha VNC: configurada (nao exibida)"
-          echo "=========================================="
-          echo "Mantenha esta execucao ativa para usar o PC."
-          echo
+          echo "RAM configurada: 4 GB"
+          echo "Nucleos virtuais: 2"
+          echo "Modo de boot: $BOOT_MODE"
+          echo "Acesso: ${URL}/vnc.html?autoconnect=true&resize=scale"
+          echo "Senha VNC: a senha informada no workflow"
+          echo "Checkpoint: salvamento ao encerrar"
+          echo "===================================="
 
+          # Mantem o workflow ativo enquanto o QEMU estiver funcionando.
           while kill -0 "$QEMU_PID" 2>/dev/null; do
-            sleep 15
+            sleep 5
           done
 
-          echo "O processo QEMU foi encerrado."
-          cat /tmp/qemu.log
+          echo "O processo QEMU encerrou."
+          cat "$QEMU_LOG" || true
 
-      - name: Salvar disco virtual no cache
+      - name: Verificar disco antes de salvar
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          DISK="$HOME/virtual-pc/mint.qcow2"
+
+          if [ ! -s "$DISK" ]; then
+            echo "Nao ha disco virtual para salvar."
+            exit 1
+          fi
+
+          qemu-img check "$DISK"
+          sync
+          echo "Disco pronto para persistencia."
+
+      - name: Salvar checkpoint no cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: ~/virtual-pc/mint.qcow2
-          key: mint-pc-${{ github.repository }}-${{ github.run_id }}
-          
+          key: mint-xfce-${{ github.repository }}-${{ github.run_id }}
