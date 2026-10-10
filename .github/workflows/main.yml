@@ -1,0 +1,293 @@
+
+name: ExtNoBrasil PC Gamer - Linux Mint macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      vnc_password:
+        description: "Senha VNC: 6 a 8 letras ou numeros"
+        required: true
+        type: string
+      boot_mode:
+        description: "Primeira vez: installer. Depois: disk."
+        required: true
+        type: choice
+        default: installer
+        options:
+          - installer
+          - disk
+
+permissions:
+  contents: read
+
+jobs:
+  virtual-pc:
+    name: ExtNoBrasil PC Virtual
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Instalar dependencias
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 qemu-utils novnc websockify \
+            socat curl wget ca-certificates git
+          mkdir -p "$HOME/virtual-pc"
+
+      - name: Restaurar disco virtual
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/virtual-pc/mint.qcow2
+          key: mint-pc-${{ github.repository }}-${{ github.run_id }}
+          restore-keys: |
+            mint-pc-${{ github.repository }}-
+
+      - name: Preparar disco e ISO
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          DIR="$HOME/virtual-pc"
+          DISK="$DIR/mint.qcow2"
+          ISO="$DIR/linuxmint.iso"
+
+          if [ ! -f "$DISK" ]; then
+            qemu-img create -f qcow2 "$DISK" 145G
+          else
+            qemu-img check "$DISK"
+          fi
+
+          if [ ! -s "$ISO" ]; then
+            wget -O "$ISO" \
+              "https://pub.linuxmint.io/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso"
+          fi
+
+          test -s "$ISO"
+          qemu-img info "$DISK"
+          ls -lh "$ISO"
+
+      - name: Preparar instalador visual macOS
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cat > "$HOME/virtual-pc/mint-macos-setup.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y git plank
+
+          cd /tmp
+          rm -rf WhiteSur-gtk-theme WhiteSur-icon-theme
+
+          git clone --depth 1 \
+            https://github.com/vinceliuice/WhiteSur-gtk-theme.git
+          cd WhiteSur-gtk-theme
+          ./install.sh -t all
+
+          cd /tmp
+          git clone --depth 1 \
+            https://github.com/vinceliuice/WhiteSur-icon-theme.git
+          cd WhiteSur-icon-theme
+          ./install.sh
+
+          mkdir -p "$HOME/.config/autostart"
+          cat > "$HOME/.config/autostart/plank.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=Plank Dock
+          Exec=plank
+          X-GNOME-Autostart-enabled=true
+          DESKTOP
+
+          echo "Instalacao visual concluida."
+          SCRIPT
+
+          chmod 755 "$HOME/virtual-pc/mint-macos-setup.sh"
+          echo "Instalador criado no ambiente do runner."
+          echo "Ele ainda precisa ser executado dentro do Mint."
+
+      - name: Instalar Cloudflare Tunnel
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /tmp/cloudflared
+          sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Iniciar PC Virtual
+        env:
+          VNC_PASSWORD: ${{ inputs.vnc_password }}
+          BOOT_MODE: ${{ inputs.boot_mode }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "::add-mask::$VNC_PASSWORD"
+
+          if [[ ! "$VNC_PASSWORD" =~ ^[A-Za-z0-9]{6,8}$ ]]; then
+            echo "Erro: a senha deve ter de 6 a 8 letras ou numeros."
+            exit 1
+          fi
+
+          DIR="$HOME/virtual-pc"
+          DISK="$DIR/mint.qcow2"
+          ISO="$DIR/linuxmint.iso"
+
+          if [ ! -s "$DISK" ] || [ ! -s "$ISO" ]; then
+            echo "Erro: disco ou ISO nao encontrado."
+            exit 1
+          fi
+
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            ACCEL=(-enable-kvm)
+            CPU=host
+            echo "KVM disponivel."
+          else
+            ACCEL=(-accel tcg,thread=multi)
+            CPU=max
+            echo "KVM indisponivel: usando emulacao por software."
+          fi
+
+          case "$BOOT_MODE" in
+            installer) BOOT=(-boot order=d,menu=on) ;;
+            disk) BOOT=(-boot order=c,menu=on) ;;
+            *)
+              echo "Modo de inicializacao invalido."
+              exit 1
+              ;;
+          esac
+
+          rm -f /tmp/qemu-monitor.sock /tmp/qemu.log
+
+          qemu-system-x86_64 \
+            "${ACCEL[@]}" \
+            -machine pc \
+            -cpu "$CPU" \
+            -smp 2 \
+            -m 4096 \
+            -drive "file=$DISK,format=qcow2,if=ide" \
+            -cdrom "$ISO" \
+            "${BOOT[@]}" \
+            -vga std \
+            -usb \
+            -device usb-tablet \
+            -rtc base=utc \
+            -display none \
+            -vnc 127.0.0.1:1,password=on \
+            -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
+            > /tmp/qemu.log 2>&1 &
+
+          QEMU_PID=$!
+
+          cleanup() {
+            kill "${CLOUDFLARED_PID:-}" 2>/dev/null || true
+            kill "${WEBSOCKIFY_PID:-}" 2>/dev/null || true
+            kill "$QEMU_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          READY=0
+          for i in $(seq 1 45); do
+            if [ -S /tmp/qemu-monitor.sock ]; then
+              READY=1
+              break
+            fi
+            if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+              cat /tmp/qemu.log
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "QEMU nao iniciou corretamente."
+            cat /tmp/qemu.log
+            exit 1
+          fi
+
+          # Configurar a senha VNC pelo monitor do QEMU.
+          MONITOR_OUTPUT=$(
+            printf 'change vnc password %s\n' "$VNC_PASSWORD" |
+              socat -T 5 - UNIX-CONNECT:/tmp/qemu-monitor.sock 2>&1 || true
+          )
+
+          if ! grep -qi "password" <<< "$MONITOR_OUTPUT"; then
+            echo "Aviso: nao foi possivel confirmar a resposta da senha VNC."
+            echo "Verifique a conexao VNC se o acesso falhar."
+          fi
+
+          # noVNC: porta web 6080 -> VNC 5901.
+          websockify --web=/usr/share/novnc \
+            6080 127.0.0.1:5901 > /tmp/websockify.log 2>&1 &
+          WEBSOCKIFY_PID=$!
+
+          sleep 3
+          if ! kill -0 "$WEBSOCKIFY_PID" 2>/dev/null; then
+            echo "Erro ao iniciar noVNC:"
+            cat /tmp/websockify.log
+            exit 1
+          fi
+
+          cloudflared tunnel \
+            --url http://127.0.0.1:6080 \
+            --no-autoupdate \
+            > /tmp/cloudflared.log 2>&1 &
+          CLOUDFLARED_PID=$!
+
+          URL=""
+          for i in $(seq 1 60); do
+            URL=$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              /tmp/cloudflared.log | head -n 1 || true)
+
+            if [ -n "$URL" ]; then
+              break
+            fi
+
+            if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
+              cat /tmp/cloudflared.log
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$URL" ]; then
+            echo "Nao foi possivel obter o endereco Cloudflare."
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+          echo
+          echo "=========================================="
+          echo "       EXT NOBRASIL PC GAMER"
+          echo "=========================================="
+          echo "Sistema: Linux Mint Cinnamon"
+          echo "Disco virtual: 145 GB"
+          echo "Memoria RAM configurada: 4 GB"
+          echo "CPU virtual: 2 nucleos"
+          echo "Modo: $BOOT_MODE"
+          echo "Endereco: ${URL}/vnc.html?autoconnect=true&resize=scale"
+          echo "Senha VNC: configurada (nao exibida)"
+          echo "=========================================="
+          echo "Mantenha esta execucao ativa para usar o PC."
+          echo
+
+          while kill -0 "$QEMU_PID" 2>/dev/null; do
+            sleep 15
+          done
+
+          echo "O processo QEMU foi encerrado."
+          cat /tmp/qemu.log
+
+      - name: Salvar disco virtual no cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/virtual-pc/mint.qcow2
+          key: mint-pc-${{ github.repository }}-${{ github.run_id }}
+          
